@@ -1,0 +1,2 @@
+# Nmap 7.80 scan initiated Mon Apr 14 12:26:47 2025 as: nmap -p 3389 --open -Pn -oG rdp_scan.txt 62.164.177.0/24
+# Nmap done at Mon Apr 14 12:27:45 2025 -- 256 IP addresses (256 hosts up) scanned in 57.97 seconds
