@@ -42,7 +42,7 @@ Dive deep into the world of Remote Desktop Protocol (RDP) with this powerful and
 ## 💡 Usage:
 
 ```bash
-python [script_name].py --ip-range [IP_RANGE] --password-file [PASSWORD_FILE_PATH] --username [USERNAME]
+python [script_name].py --password-file [PASSWORD_FILE_PATH] --username [USERNAME]
 ```
 
 ## ⚠️ Warning:
